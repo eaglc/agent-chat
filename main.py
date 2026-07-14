@@ -3,7 +3,9 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from openai import AsyncOpenAI
-
+from contextlib import asynccontextmanager
+from redis import asyncio as aioredis
+from memory import RedisStorage
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -12,13 +14,27 @@ class Settings(BaseSettings):
     openai_model: str = "deepseek-v4-flash"
     openai_api_key: str
     openai_base_url: str
+    redis_url: str
+    redis_password: str
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 settings = Settings()
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Perform any startup tasks here
+    logging.info("Starting up the FastAPI application...")
+    app.state.storage = RedisStorage(settings.redis_url, settings.redis_password)
+    yield
+    # Perform any shutdown tasks here
+    logging.info("Shutting down the FastAPI application...")
+    await app.state.storage.close()
+
+app = FastAPI(lifespan=lifespan)
 
 class ChatRequest(BaseModel):
+    session_id: str
     question: str
     model: Optional[str] = None
     base_url: Optional[str] = None
@@ -49,14 +65,23 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
         base_url=base_url
     )
 
-    logging.info(f"Using model: {model}, base_url: {base_url} api_key: {api_key}")
+    # Get the RedisStorage instance from the app state
+    storage: RedisStorage = app.state.storage
+
+    # Retrieve the chat history for the given session_id from Redis
+    history = await storage.get_history(request.session_id)
+    messages = list(history)  # Create a copy of the history to avoid modifying the original list
+    messages.append({"role": "user", "content": request.question})
 
     try:
         # Make a request to the OpenAI API
         response = await client.chat.completions.create(
             model=model,
-            messages=[{"role": "user", "content": request.question}]
+            messages=messages
         )
-        return {"answer": response.choices[0].message.content}
+        assistant_answer = response.choices[0].message.content
+        await storage.append_message(request.session_id, "user", request.question)
+        await storage.append_message(request.session_id, "assistant", assistant_answer)
+        return {"answer": assistant_answer}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
